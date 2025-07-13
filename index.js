@@ -219,9 +219,16 @@ app.get('/api/schools', async (req, res) => {
     let connection;
     try {
         connection = await pool.getConnection();
-        const [rows] = await connection.execute(
-            'SELECT id, name, principal, school_name, address, phone_no, email, num_students FROM users'
-        );
+        // In your backend/index.js, find this line:
+// app.get('/api/schools', async (req, res) => { ...
+
+// And change the SQL query from:
+// 'SELECT id, name, principal, school_name, address, phone_no, email, num_students FROM users'
+
+// TO THIS:
+const [rows] = await connection.execute(
+  'SELECT id, school_name, email, display_name, address, phone_number, student_count, contact_person FROM users'
+);
         res.json(rows);
     } catch (err) {
         console.error('Failed to fetch schools from database:', err);
