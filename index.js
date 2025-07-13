@@ -4,234 +4,238 @@ const cors = require('cors');
 const http = require('http');
 const nodemailer = require('nodemailer');
 const dotenv = require('dotenv');
-const fileUpload = require('express-fileupload'); // Keep this middleware for now, even if specific upload route is removed
+const fileUpload = require('express-fileupload');
 const session = require('express-session');
 const bodyParser = require('body-parser');
 const mysql = require('mysql2/promise'); // Using mysql2/promise for async/await
 const { Server } = require('socket.io');
 
-dotenv.config(); // Load environment variables from .env file
+dotenv.config(); // Load environment variables from .env file for local development
 
 const app = express();
-const server = http.createServer(app); // Create HTTP server for Socket.IO
+
+// --- Configuration Variables from Environment ---
+// Railway injects a PORT variable. We use a fallback for local development.
+const PORT = process.env.PORT || 3001;
+// For Socket.IO, it's often run on the same HTTP server port.
+// If you truly need a separate port for Socket.IO on Railway, you'd need a separate Railway service
+// or specific configuration, which is more advanced. For now, assume it runs on the main PORT.
+// If you explicitly set SOCKET_IO_PORT in Railway ENV and want to use it:
+// const SOCKET_IO_PORT = process.env.SOCKET_IO_PORT || 3010;
+
+// Frontend URL for CORS and meeting invitation links. This will be your Vercel URL.
+const FE_ORIGIN = process.env.FRONTEND_URL || 'http://localhost:3000';
+// Socket.IO origin for CORS. Typically the same as FE_ORIGIN.
+const SOCKET_IO_ORIGIN = process.env.SOCKET_IO_ORIGIN || 'http://localhost:3000';
+
+// --- HTTP Server Setup ---
+const server = http.createServer(app); // Create HTTP server to share with Express and Socket.IO
+
+// --- Socket.IO Server Setup ---
 const io = new Server(server, {
-  cors: {
-    origin: ["http://192.168.1.22:3000"], // Allow requests from your React app's origin
-    methods: ["GET", "POST"]
-  }
+    cors: {
+        origin: SOCKET_IO_ORIGIN, // Dynamic origin for Socket.IO
+        methods: ["GET", "POST"]
+    }
 });
 
-// Database Pool Configuration
+// --- Database Pool Configuration ---
+// These environment variables will be provided by Railway's MySQL service directly to your backend service
 const pool = mysql.createPool({
-  host: process.env.DB_HOST || 'localhost',
-  user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || 'kali',
-  database: process.env.DB_DATABASE || 'schooldb',
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0
+    host: process.env.MYSQLHOST,
+    user: process.env.MYSQLUSER,
+    password: process.env.MYSQLPASSWORD,
+    database: process.env.MYSQLDATABASE, // This should be 'railway' by default
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
 });
 
-// Middleware
+// Test Database Connection on Application Startup
+pool.getConnection()
+    .then(connection => {
+        console.log('Successfully connected to Railway MySQL database!');
+        connection.release(); // Release the connection back to the pool immediately
+    })
+    .catch(err => {
+        console.error('Failed to connect to Railway MySQL database:', err.message);
+        console.error('Please check your MYSQL_* environment variables in Railway.');
+        // It's good practice to exit if database connection fails on startup in production
+        // process.exit(1);
+    });
+
+// --- Express Middleware ---
 app.use(cors({
-  origin: 'http://192.168.1.22:3000', // Specify your frontend origin for CORS
-  credentials: true // If you're using cookies/sessions later
+    origin: FE_ORIGIN, // Dynamic origin for Express CORS
+    credentials: true // Important if you're using cookies/sessions
 }));
-app.use(express.json()); // For parsing application/json
+app.use(express.json()); // For parsing application/json bodies
 app.use(bodyParser.urlencoded({ extended: true })); // For parsing application/x-www-form-urlencoded
-app.use(fileUpload()); // For handling file uploads (middleware still active, but specific route removed)
+app.use(fileUpload()); // Middleware for handling file uploads
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'supersecretkey', // Use a strong secret in production
-  resave: false,
-  saveUninitialized: true,
-  cookie: { secure: false } // Set to true if using HTTPS
+    secret: process.env.SESSION_SECRET || 'a_fallback_secret_for_dev_only_replace_in_prod', // USE A VERY STRONG, RANDOM SECRET IN PRODUCTION
+    resave: false, // Don't save session if unmodified
+    saveUninitialized: true, // Save new sessions even if not modified
+    cookie: {
+        secure: process.env.NODE_ENV === 'production', // true in production for HTTPS
+        httpOnly: true, // Prevents client-side JavaScript from accessing cookies
+        sameSite: 'Lax' // Helps protect against CSRF attacks. Can be 'None' for cross-site with secure:true
+    }
 }));
 
-// Nodemailer Transporter Configuration
+// --- Nodemailer Transporter Configuration ---
 const transporter = nodemailer.createTransport({
-  service: 'gmail', // Or your email service provider
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
-  }
+    service: 'gmail', // Or your specific SMTP details
+    auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS
+    }
 });
 
-// In-memory storage for meeting data (for simplicity, consider a database for production)
+// --- In-Memory Storage for Meeting Data (Temporary - Migrate to DB!) ---
+// WARNING: This data will be lost on every server restart/redeploy.
+// For production, you MUST store this data in your MySQL database.
 const meetingData = {}; // { meetingId: { id, createdAt, recipientEmail, expires, slotTime, status } }
 
-// Socket.IO Connection Handling
+// --- Socket.IO Connection Handling ---
 io.on('connection', (socket) => {
-  console.log(`Socket Connected: ${socket.id}`);
+    console.log(`Socket Connected: ${socket.id}`);
 
-  // Event for a user joining a specific room
-  socket.on('join-room', (roomId) => {
-    socket.join(roomId);
-    console.log(`User ${socket.id} joined room ${roomId}`);
-    // Notify other users in the room that a new user has joined
-    socket.to(roomId).emit('user-joined', socket.id);
-  });
+    socket.on('join-room', (roomId) => {
+        socket.join(roomId);
+        console.log(`User ${socket.id} joined room ${roomId}`);
+        socket.to(roomId).emit('user-joined', socket.id); // Notify others in room
+    });
 
-  // Event for sending WebRTC signaling data (offer)
-  socket.on('send-call', ({ userToSignal, callerId, signal }) => {
-    console.log(`Sending call signal from ${callerId} to ${userToSignal}`);
-    // Forward the signal to the intended recipient
-    io.to(userToSignal).emit('receive-call', { callerId, signal });
-  });
+    socket.on('send-call', ({ userToSignal, callerId, signal }) => {
+        console.log(`Sending call signal from ${callerId} to ${userToSignal}`);
+        io.to(userToSignal).emit('receive-call', { callerId, signal }); // Forward signal
+    });
 
-  // Event for accepting WebRTC signaling data (answer)
-  socket.on('accept-call', ({ callerId, signal }) => {
-    console.log(`Accepting call signal from ${socket.id} to ${callerId}`);
-    // Forward the acceptance signal back to the caller
-    io.to(callerId).emit('call-accepted', { signal, id: socket.id });
-  });
+    socket.on('accept-call', ({ callerId, signal }) => {
+        console.log(`Accepting call signal from ${socket.id} to ${callerId}`);
+        io.to(callerId).emit('call-accepted', { signal, id: socket.id }); // Forward acceptance
+    });
 
-  // Handle disconnection
-  socket.on('disconnect', () => {
-    console.log(`Socket Disconnected: ${socket.id}`);
-    // In a more complex app, you might want to notify rooms about user departure
-  });
+    socket.on('disconnect', () => {
+        console.log(`Socket Disconnected: ${socket.id}`);
+        // Consider notifying rooms about user departure here
+    });
 });
 
-// Helper function to generate a unique meeting ID
+// --- Helper Functions ---
 const generateMeetingId = () => {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let result = '';
-  for (let i = 0; i < 8; i++) result += chars.charAt(Math.floor(Math.random() * chars.length));
-  // Ensure the generated ID is unique in our in-memory storage
-  if (meetingData[result]) {
-    return generateMeetingId(); // Recurse if ID already exists
-  }
-  return result;
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let result = '';
+    for (let i = 0; i < 8; i++) result += chars.charAt(Math.floor(Math.random() * chars.length));
+    // This uniqueness check is for in-memory storage only.
+    // If using DB, you would query the DB for uniqueness.
+    if (meetingData[result]) {
+        return generateMeetingId(); // Recurse if ID already exists
+    }
+    return result;
 };
+
+// --- API Endpoints ---
 
 // API Endpoint: Create a new meeting
 app.post('/create-meeting', async (req, res) => {
-  const { recipientEmail } = req.body;
-  if (!recipientEmail) {
-    return res.status(400).json({ success: false, message: 'Recipient email is required.' });
-  }
+    const { recipientEmail } = req.body;
+    if (!recipientEmail) {
+        return res.status(400).json({ success: false, message: 'Recipient email is required.' });
+    }
 
-  const meetingId = generateMeetingId();
-  // Meeting link expiry set to 30 minutes from creation for the invitation link itself
-  const expires = Date.now() + 30 * 60 * 1000;
-  // The meeting link will point to the frontend's schedule route
-  const meetingLink = `http://192.168.1.22:3000/schedule/${meetingId}`;
+    const meetingId = generateMeetingId();
+    // Meeting link expiry (30 minutes from creation for the invitation link itself)
+    const expires = Date.now() + 30 * 60 * 1000;
+    // The meeting link will now use the dynamic FRONTEND_URL
+    const meetingLink = `${FE_ORIGIN}/schedule/${meetingId}`;
 
-  // Store meeting details in memory
-  meetingData[meetingId] = {
-    id: meetingId,
-    createdAt: Date.now(),
-    recipientEmail,
-    expires, // Expiry for the invitation link
-    slotTime: null, // No slot time selected initially
-    status: 'pending' // Meeting status
-  };
+    // Store meeting details in memory (REMINDER: MOVE TO DB)
+    meetingData[meetingId] = {
+        id: meetingId,
+        createdAt: Date.now(),
+        recipientEmail,
+        expires,
+        slotTime: null,
+        status: 'pending'
+    };
 
-  try {
-    // Send meeting invitation email
-    await transporter.sendMail({
-      from: process.env.EMAIL_USER,
-      to: recipientEmail,
-      subject: 'Meeting Invitation',
-      html: `
-        <p>You've been invited to a meeting. Click the link below to schedule your slot and join:</p>
-        <p><a href="${meetingLink}">${meetingLink}</a></p>
-        <p>This invitation link will expire in 30 minutes.</p>
-      `
-    });
-    console.log(`Meeting ID ${meetingId} created for ${recipientEmail}. Link: ${meetingLink}`);
-    res.json({ success: true, meetingId, expires, meetingLink });
-  } catch (err) {
-    console.error('Error sending email:', err);
-    res.status(500).json({ success: false, code: 'EMAIL_FAILED', message: 'Failed to send meeting invitation email.' });
-  }
+    try {
+        await transporter.sendMail({
+            from: process.env.EMAIL_USER,
+            to: recipientEmail,
+            subject: 'Meeting Invitation',
+            html: `
+                <p>You've been invited to a meeting. Click the link below to schedule your slot and join:</p>
+                <p><a href="${meetingLink}">${meetingLink}</a></p>
+                <p>This invitation link will expire in 30 minutes.</p>
+            `
+        });
+        console.log(`Meeting ID ${meetingId} created for ${recipientEmail}. Link: ${meetingLink}`);
+        res.json({ success: true, meetingId, expires, meetingLink });
+    } catch (err) {
+        console.error('Error sending email:', err);
+        res.status(500).json({ success: false, code: 'EMAIL_FAILED', message: 'Failed to send meeting invitation email.' });
+    }
 });
 
 // API Endpoint: Select a 30-minute slot for a meeting
 app.post('/select-slot', async (req, res) => {
-  const { meetingId, slotTime } = req.body;
-  if (!meetingId || !slotTime) {
-    return res.status(400).json({ success: false, message: 'Meeting ID and slot time are required.' });
-  }
+    const { meetingId, slotTime } = req.body;
+    if (!meetingId || !slotTime) {
+        return res.status(400).json({ success: false, message: 'Meeting ID and slot time are required.' });
+    }
 
-  const meeting = meetingData[meetingId];
-  if (!meeting) {
-    return res.status(404).json({ success: false, message: 'Meeting not found.' });
-  }
+    const meeting = meetingData[meetingId];
+    if (!meeting) {
+        return res.status(404).json({ success: false, message: 'Meeting not found.' });
+    }
 
-  // Basic validation for slotTime format (HH:MM)
-  if (!/^\d{2}:\d{2}$/.test(slotTime)) {
-      return res.status(400).json({ success: false, message: 'Invalid slot time format. Expected HH:MM.' });
-  }
+    if (!/^\d{2}:\d{2}$/.test(slotTime)) {
+        return res.status(400).json({ success: false, message: 'Invalid slot time format. Expected HH:MM.' });
+    }
 
-  meeting.slotTime = slotTime; // Update the slot time
-  meeting.status = 'confirmed'; // Update meeting status
-  console.log(`Slot ${slotTime} confirmed for meeting ID ${meetingId}`);
-  res.json({ success: true, message: 'Slot confirmed successfully.' });
+    meeting.slotTime = slotTime;
+    meeting.status = 'confirmed';
+    console.log(`Slot ${slotTime} confirmed for meeting ID ${meetingId}`);
+    res.json({ success: true, message: 'Slot confirmed successfully.' });
 });
 
 // API Endpoint: Validate a meeting ID and retrieve its status/slot time
 app.get('/validate-meeting/:meetingId', (req, res) => {
-  const meeting = meetingData[req.params.meetingId];
-  if (!meeting) {
-    return res.json({ valid: false, message: 'Meeting not found.' });
-  }
-  // Check if the invitation link itself has expired (30 minutes from creation)
-  if (Date.now() > meeting.expires) {
-    return res.json({ valid: false, message: 'This meeting invitation link has expired.' });
-  }
-  // Return validity, meeting ID, and the confirmed slot time (if any)
-  res.json({ valid: true, meetingId: meeting.id, slotTime: meeting.slotTime });
-});
-
-// REMOVED: API Endpoint: Upload a document for a school (as requested)
-// This entire route handler has been removed to disable the upload functionality.
-/*
-app.post('/api/schools/:id/upload', async (req, res) => {
-  const schoolId = req.params.id;
-  if (!req.files || Object.keys(req.files).length === 0 || !req.files.document) {
-    return res.status(400).send('No file uploaded.');
-  }
-  const file = req.files.document;
-  let connection;
-  try {
-    connection = await pool.getConnection();
-    const [result] = await connection.execute(
-      'UPDATE users SET document = ?, has_document = TRUE WHERE id = ?',
-      [file.data, schoolId]
-    );
-    if (result.affectedRows === 0) {
-      return res.status(404).send('School not found.');
+    const meeting = meetingData[req.params.meetingId];
+    if (!meeting) {
+        return res.json({ valid: false, message: 'Meeting not found.' });
     }
-    res.send('Document uploaded successfully.');
-  } catch (err) {
-    console.error('Database error during file upload:', err);
-    res.status(500).send('Failed to upload document due to a server error.');
-  } finally {
-    if (connection) connection.release();
-  }
+    if (Date.now() > meeting.expires) {
+        return res.json({ valid: false, message: 'This meeting invitation link has expired.' });
+    }
+    res.json({ valid: true, meetingId: meeting.id, slotTime: meeting.slotTime });
 });
-*/
 
 // API Endpoint: Get all school records
 app.get('/api/schools', async (req, res) => {
-  let connection;
-  try {
-    connection = await pool.getConnection();
-    // UPDATED: Select all relevant columns, EXCLUDING 'num_teachers', 'document', and 'has_document'
-    const [rows] = await connection.execute(
-      'SELECT id, name, principal, school_name, address, phone_no, email, num_students FROM users'
-    );
-    res.json(rows);
-  } catch (err) {
-    console.error('Failed to fetch schools from database:', err);
-    res.status(500).send('Failed to fetch schools due to a server error.');
-  } finally {
-    if (connection) connection.release();
-  }
+    let connection;
+    try {
+        connection = await pool.getConnection();
+        const [rows] = await connection.execute(
+            'SELECT id, name, principal, school_name, address, phone_no, email, num_students FROM users'
+        );
+        res.json(rows);
+    } catch (err) {
+        console.error('Failed to fetch schools from database:', err);
+        res.status(500).send('Failed to fetch schools due to a server error.');
+    } finally {
+        if (connection) connection.release();
+    }
 });
 
-// Start the API server on port 3001
-app.listen(3001, () => console.log('API Server: http://192.168.1.22:3001'));
-// Start the Socket.IO server on port 3010
-server.listen(3010, () => console.log('Socket.IO Server: http://192.168.1.22:3010'));
+// --- Start the API and Socket.IO Server ---
+// The main server listens on the PORT provided by Railway
+server.listen(PORT, () => {
+    console.log(`Backend API & Socket.IO Server listening on port ${PORT}`);
+    console.log(`Frontend Origin configured: ${FE_ORIGIN}`);
+    console.log(`Socket.IO Origin configured: ${SOCKET_IO_ORIGIN}`);
+    console.log(`Database connected to: ${process.env.MYSQLHOST}/${process.env.MYSQLDATABASE}`);
+});
